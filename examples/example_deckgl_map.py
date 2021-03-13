@@ -64,30 +64,44 @@ if __name__ == "__main__":
 
     min_value = np.nanmin(map_data)
     max_value = np.nanmax(map_data)
+    value_range = max_value - min_value
 
     # Shift the values to start from 0 and scale them to cover
     # the whole RGB range for increased precision.
     # The client will need to reverse this operation.
-    scale_factor = (256*256*256 - 1) / (max_value - min_value)
+    scale_factor = (256*256*256 - 1) / value_range
     map_data = (map_data - min_value) * scale_factor
 
     map_data = array2d_to_png(map_data)
     colormap = "https://cdn.jsdelivr.net/gh/kylebarron/deck.gl-raster/assets/colormaps/plasma.png"
 
+
+    bounds = [432205, 6475078, 437720, 6481113]  # left, bottom, right, top
+    width = bounds[2] - bounds[0]  # right - left
+    height = bounds[3] - bounds[1]  # top - bottom
+
     deckgl_map_1 = webviz_subsurface_components.DeckGLMap(
         id = "DeckGL-Map",
         jsonData = {
             "initialViewState": {
-                "target": [0, 0, 0],
-                "zoom": 3
+                "target": [bounds[0] + width/2, bounds[1] + height/2, 0],
+                "zoom": -3
             },
             "layers": [
                 {
                     "@@type": "ColormapLayer",
                     "id": "colormap-layer",
-                    "bounds": [-50, 50, 50, -50],
+                    "bounds": bounds,
                     "image": map_data,
                     "colormap": colormap
+                },
+                {
+                    "@@type": "Hillshading2DLayer",
+                    "id": "hillshading-layer",
+                    "bounds": bounds,
+                    "opacity": 1.0,
+                    "valueRange": value_range,
+                    "image": map_data
                 }
             ],
             "views": [
@@ -98,7 +112,8 @@ if __name__ == "__main__":
                     "x": "0%",
                     "y": "0%",
                     "width": "100%",
-                    "height": "100%"
+                    "height": "100%",
+                    "flipY": False
                 },
                 {
                     "@@type": "OrthographicView",
@@ -108,12 +123,14 @@ if __name__ == "__main__":
                     "y": "75%",
                     "width": "20%",
                     "height": "25%",
+                    "flipY": False,
                     "clear": {
-                        "color": [0.9, 0.9, 0.9, 1]
+                        "color": [0.9, 0.9, 0.9, 1],
+                        "depth": True
                     },
                     "viewState": {
                         "id": "main",
-                        "zoom": 1
+                        "zoom": -5
                     }
                 }
             ]
