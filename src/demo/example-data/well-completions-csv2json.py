@@ -35,58 +35,27 @@ def get_time_series(df, time_steps):
     return result
 
 
-def time_series_to_string(series):
-    r = ""
-    for o in series:
-        c = "."
-        if o == 1:
-            c = "o"
-        elif o == -1:
-            c = "s"
-        r += c
-    return r
-
-
-def num_series_to_string(series):
-    r = ""
-    for o in series:
-        c = "."
-        if o > 0:
-            c = str(o)
-        r += c
-    return r
-
-
-def completions_to_strings(completions, open_count_reduced):
-    completion_strings = []
-    for r in completions:
-        s = ""
-        for layer in r:
-            s += "/"
-            s += time_series_to_string(layer)
-        completion_strings.append(s)
-
-    s = ""
-    for layer in open_count_reduced:
-        s += "/"
-        s += num_series_to_string(layer)
-    completion_strings.append(s)
-    return completion_strings
-
-
-def get_completions(df, layer_to_zone, time_steps, realisations):
+def extract_completions(df, layer_to_zone, time_steps, realisations):
     '''
-    Extracts completions into a list of lists.
+    Extracts completions into a dictionary on the form
+    {
+        ("zone1", 0): [ [ time_sequence_realization_1 ],
+                   [ time_sequence_realization_2 ],
+                    ...
+        ("zone2", 1): ---
+    }
+    The key is the tuple of zone and layer (multiple layers can be mapped to one zone)
     Full matrix - every time step and realisation.
     '''
-    completions = []
-    for rname, realdata in df.groupby('REAL'):
-        real = []
-        for layer in layer_to_zone.keys():
-            # TODO: multiple layers to same zone does not work
-            data = realdata.loc[realdata['K1'] == layer]
-            real.append(get_time_series(data, time_steps))
-        completions.append(real)
+    completions = {}
+    for layer, zone_name in layer_to_zone.items():
+        # TODO: not reading K2 from table....
+        data = df.loc[df['K1'] == layer]
+        layer_data = []
+        for rname, realdata in data.groupby('REAL'):
+            layer_data.append(get_time_series(realdata, time_steps))
+        if len(layer_data) > 0:
+            completions[(zone_name, layer)] = layer_data
     return completions
 
 
@@ -128,34 +97,37 @@ def extract_kh(df, layer_to_zone):
     return data_by_zone
 
 
-def extract_well(df, well, layer_to_zone, time_steps, realisations):
-    well_dict = {}
-    well_dict['name'] = well
+def get_open_fractions(completions, realisation_count):
+    open_frac = {}
+    for zone_layer, values in completions.items():
+        # TODO: We are not dealing correctly with muliple layers per zone...
+        zone_name, layer = zone_layer
 
-    completions = get_completions(
-        df, layer_to_zone, time_steps, realisations)
+        # get rid of the negative "shut"-values
+        open_count = np.maximum(np.asarray(values), 0)
+        open_count_reduced = open_count.sum(axis=0)  # sum over realisations
 
-    # get rid of the negative "shut"-values
-    open_count = np.maximum(np.asarray(completions), 0)
-    open_count_reduced = open_count.sum(axis=0)  # sum over realisations
 #    shut_count = np.maximum(np.asarray(completions) * (-1), 0)
 #    shut_count_reduced = shut_count.sum(axis=0)
 
-    # convert to string - for debugging
-    if False:
-        completion_strings = completions_to_strings(
-            completions, open_count_reduced)
-        well_dict['debug'] = completion_strings
+        # calculate fraction of open realisations
+        open_frac[zone_name] = np.asarray(
+            open_count_reduced, dtype=np.float64) / float(realisation_count)
+    return open_frac
 
-    # calculate fraction of open realisations
-    open_frac = np.asarray(
-        open_count_reduced, dtype=np.float64) / float(len(realisations))
+
+def extract_well_completions(df, layer_to_zone, time_steps, realisations):
+
+    completions = extract_completions(
+        df, layer_to_zone, time_steps, realisations)
+
+    open_frac = get_open_fractions(completions, len(realisations))
 
     # retrieve the KH values for all realisations in a dictionary
     kh_all_zones = extract_kh(df, layer_to_zone)
 
     result = {}
-    for zone_name, time_series in zip(layer_to_zone.values(), open_frac):
+    for zone_name, time_series in open_frac.items():
         time_series = format_time_series(time_series)
         if time_series is not None:
             r = {}
@@ -166,20 +138,17 @@ def extract_well(df, well, layer_to_zone, time_steps, realisations):
             r['KHMin'] = np.amin(kh)
             r['KHMax'] = np.amax(kh)
             result[zone_name] = r
-
-    well_dict['completions'] = result
-
-    # TODO: Should make some more interesting well attributes
-    well_dict['type'] = 'Producer'
-    well_dict['region'] = 'Region1'
-    return well_dict
+    return result
 
 
 def extract_wells(df, layer_to_zone, time_steps, realisations):
     well_list = []
-    for name, well_group in df.groupby('WELL'):
-        well_list.append(extract_well(
-            well_group, name, layer_to_zone, time_steps, realisations))
+    for well_name, well_group in df.groupby('WELL'):
+        well = {}
+        well['name'] = well_name
+        well['completions'] = extract_well_completions(well_group, layer_to_zone,
+                                                       time_steps, realisations)
+        well_list.append(well)
     return well_list
 
 
@@ -201,13 +170,9 @@ def extract_stratigraphy(zone_names):
     return result
 
 
-def create_well_completion_dict():
-    # fixed seed to avoid different colors between runs
-    random.seed(1234)
-    df = pandas.read_csv('compdat.csv')
+def create_well_completion_dict(filename):
 
     time_steps = sorted(pandas.unique(df['DATE']))
-
     realisations = np.asarray(
         sorted(pandas.unique(df['REAL'])), dtype=np.int32)
 
@@ -224,17 +189,26 @@ def create_well_completion_dict():
     result = {}
     result['stratigraphy'] = extract_stratigraphy(zone_names)
     result['timeSteps'] = time_steps
-
-    #zone_names = [a['name'] for a in result['stratigraphy']]
     result['wells'] = extract_wells(
         df, layer_to_zone, time_steps, realisations)
     return result
 
 
-result = create_well_completion_dict()
+def add_well_attributes(wells):
+    for well in wells:
+        # TODO: Should make some more interesting well attributes
+        well['type'] = 'Producer'
+        well['region'] = 'Region1'
+
+
+# fixed seed to avoid different colors between runs
+random.seed(1234)
+filename = 'compdat.csv'
+df = pandas.read_csv(filename)
+result = create_well_completion_dict(df)
+add_well_attributes(result['wells'])
 # json_str = json.dumps(result)
 
 # more human friendly output:
 json_str = json.dumps(result, indent=2)
-
 print(json_str)
