@@ -49,7 +49,7 @@ def extract_completions(df, layer_to_zone, time_steps, realisations):
     '''
     completions = {}
     for layer, zone_name in layer_to_zone.items():
-        # TODO: not reading K2 from table....
+        # TODO: assuming K1 == K2...
         data = df.loc[df['K1'] == layer]
         layer_data = []
         for rname, realdata in data.groupby('REAL'):
@@ -59,35 +59,50 @@ def extract_completions(df, layer_to_zone, time_steps, realisations):
     return completions
 
 
-def format_time_series(time_series):
+def format_time_series(series):
     '''
-    The function compresses the fraction of completed realisation into a more compact form:
-    [0, 0, 0, 0.25, 0.25, 1.0, 1.0] -> { t: [3, 5], f: [0.25, 1.0] }
-    t is a list of list of time steps where the fraction changes,
-    f is the corresponding open fraction.
+    The function compresses the open/shut state from a value for every time step:
+      ([0, 0, 0, 0.25, 0.25, 1.0, 0], # open state
+       [0, 0, 0, 0,    0,    0,   1.0] # shut state
+       )
+    into a more compact form:
+      ([3, 5, 6],        # time steps when the state changes
+       [0.25, 1.0, 0.0], # open state
+       [0,     0,  1.0]  # shut state
+       )
     '''
     time_steps = []
     values = []
+    shut_values = []
+
+    time_series, shut_series = series
     n = len(time_series)
     v0 = time_series[0]
-    if v0 > 0.:
+    s0 = shut_series[0]
+    if v0 > 0. or s0 > 0.:
         time_steps.append(0)
         values.append(v0)
+        shut_values.append(s0)
+
     for i in range(1, n):
         v = time_series[i]
-        if v != v0:
+        s = shut_series[i]
+        if v != v0 or s != s0:
             time_steps.append(i)
             values.append(v)
+            shut_values.append(s)
             v0 = v
+            s0 = s
 
     if len(time_steps) == 0:
         return None
-    return (time_steps, values)
+    return (time_steps, values, shut_values)
 
 
 def extract_kh(df, layer_to_zone):
     data_by_zone = {}
     for layer, zone_name in layer_to_zone.items():
+        # TODO: assuming K1 == K2...
         d = df.loc[df['K1'] == layer]
         if d.shape[0] > 0:
             data = d['KH'].to_numpy()
@@ -97,23 +112,30 @@ def extract_kh(df, layer_to_zone):
     return data_by_zone
 
 
-def get_open_fractions(completions, realisation_count):
-    open_frac = {}
+def get_open_shut_fractions(completions, realisation_count):
+    open_shut_frac = {}
     for zone_layer, values in completions.items():
-        # TODO: We are not dealing correctly with muliple layers per zone...
+        # TODO: Multiple layers per zone is not handled properly
+        # Only one of the layers will be captured
+
         zone_name, layer = zone_layer
 
         # get rid of the negative "shut"-values
         open_count = np.maximum(np.asarray(values), 0)
-        open_count_reduced = open_count.sum(axis=0)  # sum over realisations
+        # sum over realisations
+        open_count_reduced = open_count.sum(axis=0) / float(realisation_count)
 
-#    shut_count = np.maximum(np.asarray(completions) * (-1), 0)
-#    shut_count_reduced = shut_count.sum(axis=0)
+        shut_count = np.maximum(np.asarray(values)*(-1.), 0)
+        # sum over realisations
+        shut_count_reduced = shut_count.sum(axis=0) / float(realisation_count)
 
-        # calculate fraction of open realisations
-        open_frac[zone_name] = np.asarray(
-            open_count_reduced, dtype=np.float64) / float(realisation_count)
-    return open_frac
+        # fraction of open/shut realisations
+        open_shut_frac[zone_name] = (
+            np.asarray(open_count_reduced, dtype=np.float64),
+            np.asarray(shut_count_reduced, dtype=np.float64)
+        )
+
+    return open_shut_frac
 
 
 def extract_well_completions(df, layer_to_zone, time_steps, realisations):
@@ -121,22 +143,23 @@ def extract_well_completions(df, layer_to_zone, time_steps, realisations):
     completions = extract_completions(
         df, layer_to_zone, time_steps, realisations)
 
-    open_frac = get_open_fractions(completions, len(realisations))
+    open_shut_frac = get_open_shut_fractions(completions, len(realisations))
 
     # retrieve the KH values for all realisations in a dictionary
     kh_all_zones = extract_kh(df, layer_to_zone)
 
     result = {}
-    for zone_name, time_series in open_frac.items():
-        time_series = format_time_series(time_series)
-        if time_series is not None:
+    for zone_name, series in open_shut_frac.items():
+        formatted_time_series = format_time_series(series)
+        if formatted_time_series is not None:
             r = {}
-            r['t'] = time_series[0]
-            r['f'] = time_series[1]
+            r['t'] = formatted_time_series[0]
+            r['open'] = formatted_time_series[1]
+            r['shut'] = formatted_time_series[2]
             kh = kh_all_zones[zone_name]
-            r['KHMean'] = kh.mean()
-            r['KHMin'] = np.amin(kh)
-            r['KHMax'] = np.amax(kh)
+            r['khMean'] = kh.mean()
+            r['khMin'] = np.amin(kh)
+            r['khMax'] = np.amax(kh)
             result[zone_name] = r
     return result
 
