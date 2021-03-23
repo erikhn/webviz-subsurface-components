@@ -42,35 +42,162 @@ def get_time_series(df, time_steps):
     return (result, result_kh)
 
 
+def time_series_indexes_by_zone(df, layer_to_zone):
+    '''
+    Identifies completions belonging to the same (i,j,k).
+    Organizes the result in a dictionary by zone and (i,j,k):
+    Outputs:
+    {
+        'zone1': {
+            (i,j,k): [index1, index2, index3 ... ],
+            (i,j,k): [...],
+            ...
+        }
+        'zone2: {
+            ...
+        }
+    }
+    Indexes are row indexes into the dataframe.
+    '''
+    ts = {}
+    # identify i,j,k corresponding to zone
+    for index in range(df.shape[0]):
+        i = df['I'].iat[index]
+        j = df['J'].iat[index]
+        k1 = df['K1'].iat[index]
+        k2 = df['K2'].iat[index]
+
+        # TODO
+        # currently we don't support completions covering several layers
+        assert(k1 == k2)
+
+        zone_name = layer_to_zone[k1]
+        if zone_name not in ts.keys():
+            ts[zone_name] = {}
+
+        a = (i, j, k1)
+        if a not in ts[zone_name].keys():
+            ts[zone_name][a] = []
+        ts[zone_name][a].append(index)
+    return ts
+
+
+def time_series_by_zone(df, ts, time_steps):
+    '''
+    Takes the output from time_series_indexes_by_zone and produces
+    a new dictionary where the row indexes have been replaced by
+    time series for opsh and kh.
+    '''
+    gs = {}
+    for zonename, zonedata in ts.items():
+        gs[zonename] = {}
+        zone = gs[zonename]
+        for cellidx, indexes in zonedata.items():
+            zone[cellidx] = {}
+            cell = zone[cellidx]
+            comp, kh = get_time_series(
+                df.iloc[indexes, :], time_steps)
+            cell['opsh'] = comp
+            cell['kh'] = kh
+    return gs
+
+
+def reduce_open_shut(values):
+    '''
+    This function reduces several candidate for open/shut time-series into a single one
+    when there are more than one completed cell for a well/zone/realisation.
+    '''
+    arr = np.asarray(values)
+
+    open_count = np.maximum(arr, 0)
+    open_count_reduced = open_count.sum(axis=0)
+
+    shut_count = np.maximum(arr*(-1.), 0)
+    shut_count_reduced = shut_count.sum(axis=0)
+
+    time_step_count = open_count_reduced.shape[0]
+
+    opsh = []
+    for i in range(time_step_count):
+        v = 0  # default is non-existing completion
+        # if any value is open, we call the whole zone open,
+        # else if anything is shut, we call it shut.
+        if open_count_reduced[i] > 0:
+            v = 1
+        elif shut_count_reduced[i] > 0:
+            v = -1
+        opsh.append(v)
+    return opsh
+
+
+def reduce_kh(values):
+    '''
+    This function reduces several candidate for KH time-series into a single one
+    when there are more than one completed cell for a well/zone/realisation.
+    F.ex the KH can be averaged, summed...
+    It is also allowed to pass all values back for statistical calculations.
+    '''
+    arr = np.asarray(values)
+
+    # sum the KH for all cells in a zone
+#    return arr.sum(axis=0)
+
+    # this will preserve all the values for the KH statistics
+    return arr
+
+
+def reduce_over_cells(ts):
+    '''
+    This function reduces several candidate time-series into a single one
+    when there are more than one completed cell for a well/zone/realisation.
+    '''
+    result = {}
+    for zonename, zonedata in ts.items():
+        result[zonename] = {}
+        zone = result[zonename]
+
+        opsh = [v['opsh'] for v in zonedata.values()]
+        zone['opsh'] = reduce_open_shut(opsh)
+
+        kh = [v['kh'] for v in zonedata.values()]
+        zone['kh'] = reduce_kh(kh)
+
+    return result
+
+
 def get_completions_by_zone(df, layer_to_zone, time_steps, realisations):
     '''
     Extracts completions into a dictionary of 2D arrays on the form
     {
-        ("zone1", 0): {
-            'opsh': 2D array of open/shut values encoded as 1 or -1. 0 for missing.
-            'kh': 2D array of kh values. Nan for missing.
-        ("zone2", 1): ---
+        "zone1": {
+            'opsh': {
+                realisation 1: [ 1d list - time series]
+                realisation 2: [ ... ]
+                ...
+            }
+            'kh': {
+                realisation 1: [ 1d or 2d list - Nan for missing]
+                realisation 2: [ 1d or 2d list - Nan for missing]
+                ...
+                }
+        "zone2": ---
     }
-    2D arrays have dimension [time_steps x realisations].
-    The dictionary key is the tuple of zone and layer (multiple layers can be mapped to one zone).
     '''
     completions = {}
-    for layer, zone_name in layer_to_zone.items():
-        # TODO: assuming K1 == K2...
-        data = df.loc[df['K1'] == layer]
+    for rname, realdata in df.groupby('REAL'):
+        ts = time_series_indexes_by_zone(realdata, layer_to_zone)
+        gs = time_series_by_zone(realdata, ts, time_steps)
+        rs = reduce_over_cells(gs)
 
-        layer_data = []
-        kh_data = []
-        for rname, realdata in data.groupby('REAL'):
-            comp, kh = get_time_series(realdata, time_steps)
-            layer_data.append(comp)
-            kh_data.append(kh)
+        for zone_name, values in rs.items():
+            if zone_name not in completions.keys():
+                completions[zone_name] = {}
+                completions[zone_name]['opsh'] = {}
+                completions[zone_name]['kh'] = {}
+            zone = completions[zone_name]
+            zone['opsh'][rname] = rs[zone_name]['opsh']
+            zone['kh'][rname] = rs[zone_name]['kh']
 
-        if len(layer_data) > 0:
-            d = {}
-            d['opsh'] = layer_data
-            d['kh'] = kh_data
-            completions[(zone_name, layer)] = d
     return completions
 
 
@@ -124,11 +251,14 @@ def compress_time_series(series):
     return result
 
 
-def get_kh_stats_series(values):
+def get_kh_stats_series(dict_values):
     '''
     Takes 2D array of KH as input (time x realisation).
     Creates statistics: mean, max and min as function of time.
     '''
+    values = []
+    for r, d in dict_values.items():
+        values.append(np.asarray(d).flatten())
     kh_arr2d = np.asarray(values)
 
 # this works, but gives runtime warnings
@@ -153,11 +283,15 @@ def get_kh_stats_series(values):
     return {'khMean': kh_avg, 'khMin': kh_min, 'khMax': kh_max}
 
 
-def get_open_shut_fractions(values, realisation_count):
+def get_open_shut_fractions(dict_values, realisation_count):
     '''
     Takes 2D array of open/shut/missing as input, and total number of realisations.
     Calculates the fraction of open and shut for each time step.
     '''
+    values = []
+    for r, d in dict_values.items():
+        values.append(d)
+
     # get rid of the negative "shut"-values
     open_count = np.maximum(np.asarray(values), 0)
     # sum over realisations
@@ -188,11 +322,7 @@ def extract_well_completions(df, layer_to_zone, time_steps, realisations):
         df, layer_to_zone, time_steps, realisations)
 
     result = {}
-    for zone_name_layer, comps in completions.items():
-
-        # TODO: not combining result for different layers merged into the same zone yet
-        zone_name, layer = zone_name_layer
-
+    for zone_name, comps in completions.items():
         series = get_open_shut_fractions(comps['opsh'], len(realisations))
         series.update(get_kh_stats_series(comps['kh']))
 
@@ -207,8 +337,19 @@ def extract_wells(df, layer_to_zone, time_steps, realisations):
     for well_name, well_group in df.groupby('WELL'):
         well = {}
         well['name'] = well_name
-        well['completions'] = extract_well_completions(well_group, layer_to_zone,
-                                                       time_steps, realisations)
+
+        comp = extract_well_completions(well_group, layer_to_zone,
+                                        time_steps, realisations)
+
+        # stratigraphic sorting
+        sorted_comp = {}
+        for zname in layer_to_zone.values():
+            try:
+                sorted_comp[zname] = comp[zname]
+            except KeyError:
+                pass
+
+        well['completions'] = sorted_comp
         well_list.append(well)
     return well_list
 
@@ -240,7 +381,7 @@ def create_well_completion_dict(filename):
     layers = np.sort(pandas.unique(df['K1']))
 
     # construct a map from layer to zone name
-    # NOTE: multiple layers mapped to the same zone does not work.
+    # NOTE: multiple layers mapped to the same zone should work, but not tested...
     layer_to_zone = {}
     zone_names = []
     for layer in layers:
@@ -257,10 +398,23 @@ def create_well_completion_dict(filename):
 
 
 def add_well_attributes(wells):
+    well_type = ['Injector', 'Producer']
+    well_region = ['', 'Region 1', 'Region 2', 'Region 3', 'Region 4']
+    well_user_group = ['', 'my group 1', 'my group 2']
+
     for well in wells:
+        attributes = {}
+
+        attributes['type'] = random.choice(well_type)
+        attributes['region'] = random.choice(well_region)
+        choice = random.choice(well_user_group)
+        if choice:
+            attributes['user defined category'] = choice
+
+        well['attributes'] = attributes
         # TODO: Should make some more interesting well attributes
-        well['type'] = 'Producer'
-        well['region'] = 'Region1'
+#        well['type'] = 'Producer'
+#        well['region'] = 'Region1'
 
 
 if __name__ == '__main__':
