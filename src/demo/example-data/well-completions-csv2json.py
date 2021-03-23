@@ -2,28 +2,34 @@ import pandas
 import numpy as np
 import random
 import json
+import math
 
 
 def get_time_series(df, time_steps):
     '''
-    Creates a time series with a value for each time step in the form
-    [0,0,0,1,1,1,1,-1,-1,-1]
-    '0' means no event, '1' is open, '-1' is shut.
-    The input data frame is assumed to contain data for single well,
-    single zone, single realisation.
-    '''
-    if df.shape[0] == 0:
-        return [0] * len(time_steps)
+    Input:
+      Pandas data frame containing data for a single well, single zone, single realisation.
+      Sorted list of all time steps in the dataset.
 
+    Creates time series for open/shut state and KH.
+    The open/shut info is formatted like this:
+    [0,0,0,1,1,1,1,-1,-1,-1]
+    '0' means completion not existing, '1' is open, '-1' is shut.
+    KH:
+    [nan, nan, nan, value1, value1, value1, value1, value2, value2, value2]
+    '''
     result = []
+    result_kh = []
     d = df.sort_values(by=['DATE'])
 
     is_open = 0
+    kh = math.nan
     c = 0
     t0 = d['DATE'].iat[0]
     for t in time_steps:
         if t == t0:
             v = d['OP/SH'].iat[c]
+            kh = d['KH'].iat[c]
             if v == 'OPEN':
                 is_open = 1
             elif v == 'SHUT':
@@ -32,36 +38,52 @@ def get_time_series(df, time_steps):
             if c < d.shape[0]:
                 t0 = d['DATE'].iat[c]
         result.append(is_open)
-    return result
+        result_kh.append(kh)
+    return (result, result_kh)
 
 
-def extract_completions(df, layer_to_zone, time_steps, realisations):
+def get_completions_by_zone(df, layer_to_zone, time_steps, realisations):
     '''
-    Extracts completions into a dictionary on the form
+    Extracts completions into a dictionary of 2D arrays on the form
     {
-        ("zone1", 0): [ [ time_sequence_realization_1 ],
-                   [ time_sequence_realization_2 ],
-                    ...
+        ("zone1", 0): {
+            'opsh': 2D array of open/shut values encoded as 1 or -1. 0 for missing.
+            'kh': 2D array of kh values. Nan for missing.
         ("zone2", 1): ---
     }
-    The key is the tuple of zone and layer (multiple layers can be mapped to one zone)
-    Full matrix - every time step and realisation.
+    2D arrays have dimension [time_steps x realisations].
+    The dictionary key is the tuple of zone and layer (multiple layers can be mapped to one zone).
     '''
     completions = {}
     for layer, zone_name in layer_to_zone.items():
         # TODO: assuming K1 == K2...
         data = df.loc[df['K1'] == layer]
+
         layer_data = []
+        kh_data = []
         for rname, realdata in data.groupby('REAL'):
-            layer_data.append(get_time_series(realdata, time_steps))
+            comp, kh = get_time_series(realdata, time_steps)
+            layer_data.append(comp)
+            kh_data.append(kh)
+
         if len(layer_data) > 0:
-            completions[(zone_name, layer)] = layer_data
+            d = {}
+            d['opsh'] = layer_data
+            d['kh'] = kh_data
+            completions[(zone_name, layer)] = d
     return completions
 
 
-def format_time_series(series):
+def compress_time_series(series):
     '''
-    The function compresses the open/shut state from a value for every time step:
+    Input:
+      Dictionary of time series. Must contain series for 'open' and 'shut'.
+
+    The function uses the open/shut state to compress the time series.
+    The inital time steps are skipped, if the completion does not exist in any realisation.
+    Then only the time steps where open/shut state changes is captured.
+
+    Example:
       ([0, 0, 0, 0.25, 0.25, 1.0, 0], # open state
        [0, 0, 0, 0,    0,    0,   1.0] # shut state
        )
@@ -70,97 +92,113 @@ def format_time_series(series):
        [0.25, 1.0, 0.0], # open state
        [0,     0,  1.0]  # shut state
        )
+
+    Any additional time series (KH) is transfered using the same time steps sampling.
     '''
     time_steps = []
-    values = []
-    shut_values = []
 
-    time_series, shut_series = series
-    n = len(time_series)
-    v0 = time_series[0]
-    s0 = shut_series[0]
-    if v0 > 0. or s0 > 0.:
-        time_steps.append(0)
-        values.append(v0)
-        shut_values.append(s0)
+    result = {}
+    result['t'] = []
+    for key in series.keys():
+        result[key] = []
 
-    for i in range(1, n):
-        v = time_series[i]
+    open_series = series['open']
+    shut_series = series['shut']
+
+    is_open = 0
+    is_shut = 0
+    n = len(open_series)
+    for i in range(0, n):
+        o = open_series[i]
         s = shut_series[i]
-        if v != v0 or s != s0:
+        if (i == 0 and (o > 0. or s > 0.)) or o != is_open or s != is_shut:
             time_steps.append(i)
-            values.append(v)
-            shut_values.append(s)
-            v0 = v
-            s0 = s
+            for key in series.keys():
+                result[key].append(series[key][i])
+            is_open = open_series[i]
+            is_shut = shut_series[i]
 
     if len(time_steps) == 0:
         return None
-    return (time_steps, values, shut_values)
+    result['t'] = time_steps
+    return result
 
 
-def extract_kh(df, layer_to_zone):
-    data_by_zone = {}
-    for layer, zone_name in layer_to_zone.items():
-        # TODO: assuming K1 == K2...
-        d = df.loc[df['K1'] == layer]
-        if d.shape[0] > 0:
-            data = d['KH'].to_numpy()
-            if zone_name in data_by_zone:
-                data = np.concatenate((data_by_zone[zone_name], data))
-            data_by_zone[zone_name] = data
-    return data_by_zone
+def get_kh_stats_series(values):
+    '''
+    Takes 2D array of KH as input (time x realisation).
+    Creates statistics: mean, max and min as function of time.
+    '''
+    kh_arr2d = np.asarray(values)
+
+# this works, but gives runtime warnings
+#    kh_avg = np.nanmean(kh_arr2d, axis=0)
+#    kh_min = np.nanmin(kh_arr2d, axis=0)
+#    kh_max = np.nanmax(kh_arr2d, axis=0)
+
+    # process timesteps one by one. Check for all nans.
+    kh_avg = []
+    kh_min = []
+    kh_max = []
+    for i in range(kh_arr2d.shape[1]):
+        if np.count_nonzero(~np.isnan(kh_arr2d[:, i])) > 0:
+            kh_avg.append(np.nanmean(kh_arr2d[:, i]))
+            kh_min.append(np.nanmin(kh_arr2d[:, i]))
+            kh_max.append(np.nanmax(kh_arr2d[:, i]))
+        else:
+            kh_avg.append(math.nan)
+            kh_min.append(math.nan)
+            kh_max.append(math.nan)
+
+    return {'khMean': kh_avg, 'khMin': kh_min, 'khMax': kh_max}
 
 
-def get_open_shut_fractions(completions, realisation_count):
-    open_shut_frac = {}
-    for zone_layer, values in completions.items():
-        # TODO: Multiple layers per zone is not handled properly
-        # Only one of the layers will be captured
+def get_open_shut_fractions(values, realisation_count):
+    '''
+    Takes 2D array of open/shut/missing as input, and total number of realisations.
+    Calculates the fraction of open and shut for each time step.
+    '''
+    # get rid of the negative "shut"-values
+    open_count = np.maximum(np.asarray(values), 0)
+    # sum over realisations
+    open_count_reduced = open_count.sum(axis=0) / float(realisation_count)
 
-        zone_name, layer = zone_layer
+    shut_count = np.maximum(np.asarray(values)*(-1.), 0)
+    # sum over realisations
+    shut_count_reduced = shut_count.sum(axis=0) / float(realisation_count)
 
-        # get rid of the negative "shut"-values
-        open_count = np.maximum(np.asarray(values), 0)
-        # sum over realisations
-        open_count_reduced = open_count.sum(axis=0) / float(realisation_count)
-
-        shut_count = np.maximum(np.asarray(values)*(-1.), 0)
-        # sum over realisations
-        shut_count_reduced = shut_count.sum(axis=0) / float(realisation_count)
-
-        # fraction of open/shut realisations
-        open_shut_frac[zone_name] = (
-            np.asarray(open_count_reduced, dtype=np.float64),
-            np.asarray(shut_count_reduced, dtype=np.float64)
-        )
-
-    return open_shut_frac
+    # fraction of open/shut realisations
+    return {
+        'open': np.asarray(open_count_reduced, dtype=np.float64),
+        'shut': np.asarray(shut_count_reduced, dtype=np.float64)
+    }
 
 
 def extract_well_completions(df, layer_to_zone, time_steps, realisations):
+    '''
+    Input:
+      Pandas data frame for one well.
+      Map from layer index to zone name.
+      All time steps (sorted).
+      All realisations.
 
-    completions = extract_completions(
+    Returns completion time-series for the well aggreated over realisations.
+    '''
+    completions = get_completions_by_zone(
         df, layer_to_zone, time_steps, realisations)
 
-    open_shut_frac = get_open_shut_fractions(completions, len(realisations))
-
-    # retrieve the KH values for all realisations in a dictionary
-    kh_all_zones = extract_kh(df, layer_to_zone)
-
     result = {}
-    for zone_name, series in open_shut_frac.items():
-        formatted_time_series = format_time_series(series)
+    for zone_name_layer, comps in completions.items():
+
+        # TODO: not combining result for different layers merged into the same zone yet
+        zone_name, layer = zone_name_layer
+
+        series = get_open_shut_fractions(comps['opsh'], len(realisations))
+        series.update(get_kh_stats_series(comps['kh']))
+
+        formatted_time_series = compress_time_series(series)
         if formatted_time_series is not None:
-            r = {}
-            r['t'] = formatted_time_series[0]
-            r['open'] = formatted_time_series[1]
-            r['shut'] = formatted_time_series[2]
-            kh = kh_all_zones[zone_name]
-            r['khMean'] = kh.mean()
-            r['khMin'] = np.amin(kh)
-            r['khMax'] = np.amax(kh)
-            result[zone_name] = r
+            result[zone_name] = formatted_time_series
     return result
 
 
@@ -202,6 +240,7 @@ def create_well_completion_dict(filename):
     layers = np.sort(pandas.unique(df['K1']))
 
     # construct a map from layer to zone name
+    # NOTE: multiple layers mapped to the same zone does not work.
     layer_to_zone = {}
     zone_names = []
     for layer in layers:
@@ -224,14 +263,15 @@ def add_well_attributes(wells):
         well['region'] = 'Region1'
 
 
-# fixed seed to avoid different colors between runs
-random.seed(1234)
-filename = 'compdat.csv'
-df = pandas.read_csv(filename)
-result = create_well_completion_dict(df)
-add_well_attributes(result['wells'])
-# json_str = json.dumps(result)
+if __name__ == '__main__':
+    # fixed seed to avoid different colors between runs
+    random.seed(1234)
+    filename = 'compdat.csv'
+    df = pandas.read_csv(filename)
+    result = create_well_completion_dict(df)
+    add_well_attributes(result['wells'])
+    # json_str = json.dumps(result)
 
-# more human friendly output:
-json_str = json.dumps(result, indent=2)
-print(json_str)
+    # more human friendly output:
+    json_str = json.dumps(result, indent=2)
+    print(json_str)
