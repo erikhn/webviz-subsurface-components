@@ -57,7 +57,7 @@ def time_series_indexes_by_zone(df, layer_to_zone):
             ...
         }
     }
-    Indexes are row indexes into the dataframe.
+    The list of indexes refers to rows in the dataframe.
     '''
     ts = {}
     # identify i,j,k corresponding to zone
@@ -135,9 +135,11 @@ def reduce_kh(values):
     This function reduces several candidate for KH time-series into a single one
     when there are more than one completed cell for a well/zone/realisation.
     F.ex the KH can be averaged, summed...
-    It is also allowed to pass all values back for statistical calculations.
+    It may also return the full 2d array unchanged.
     '''
     arr = np.asarray(values)
+
+    # TODO: Choose how to combine KH values
 
     # sum the KH for all cells in a zone
 #    return arr.sum(axis=0)
@@ -185,8 +187,13 @@ def get_completions_by_zone(df, layer_to_zone, time_steps, realisations):
     '''
     completions = {}
     for rname, realdata in df.groupby('REAL'):
+        # first find the indexes corresponding to time series:
         ts = time_series_indexes_by_zone(realdata, layer_to_zone)
+
+        # extract opsh and kh as time series over all the time steps
         gs = time_series_by_zone(realdata, ts, time_steps)
+
+        # get rid of multiples caused by more than one (i,j,k) per zone.
         rs = reduce_over_cells(gs)
 
         for zone_name, values in rs.items():
@@ -232,6 +239,11 @@ def compress_time_series(series):
     open_series = series['open']
     shut_series = series['shut']
 
+    # validate input
+    time_step_count = len(open_series)
+    for s in series.values():
+        assert(len(s) == time_step_count)
+
     is_open = 0
     is_shut = 0
     n = len(open_series)
@@ -253,13 +265,31 @@ def compress_time_series(series):
 
 def get_kh_stats_series(dict_values):
     '''
-    Takes 2D array of KH as input (time x realisation).
-    Creates statistics: mean, max and min as function of time.
+    Input:
+      Dictionary of data for each realisation:
+      {
+          1: [ [ time series ] ]
+          2: [ ... ]
+          ...
+      }
+
+    The data for each realisation can be 1d or 2d.
+    Returns mean, max and min as time series in a dictionary.
     '''
     values = []
     for r, d in dict_values.items():
-        values.append(np.asarray(d).flatten())
+        arr = np.asarray(d)
+        # if there are 2d time series, treat the extra dimension as
+        # extra realisations.
+        if arr.ndim > 1:
+            for i in range(arr.shape[0]):
+                values.append(arr[i, :])
+        else:
+            values.append(arr)
+
     kh_arr2d = np.asarray(values)
+
+    # calculate mean, min, max across realisations
 
 # this works, but gives runtime warnings
 #    kh_avg = np.nanmean(kh_arr2d, axis=0)
@@ -341,7 +371,7 @@ def extract_wells(df, layer_to_zone, time_steps, realisations):
         comp = extract_well_completions(well_group, layer_to_zone,
                                         time_steps, realisations)
 
-        # stratigraphic sorting
+        # stratigraphic sorting of completions
         sorted_comp = {}
         for zname in layer_to_zone.values():
             try:
@@ -374,7 +404,10 @@ def extract_stratigraphy(zone_names):
 
 def create_well_completion_dict(filename):
 
+    # identify all time steps in the dataframe
     time_steps = sorted(pandas.unique(df['DATE']))
+
+    # and all realisations
     realisations = np.asarray(
         sorted(pandas.unique(df['REAL'])), dtype=np.int32)
 
@@ -398,6 +431,9 @@ def create_well_completion_dict(filename):
 
 
 def add_well_attributes(wells):
+    '''
+    Adds some random well attributes.
+    '''
     well_type = ['Injector', 'Producer']
     well_region = ['', 'Region 1', 'Region 2', 'Region 3', 'Region 4']
     well_user_group = ['', 'my group 1', 'my group 2']
@@ -412,9 +448,6 @@ def add_well_attributes(wells):
             attributes['user defined category'] = choice
 
         well['attributes'] = attributes
-        # TODO: Should make some more interesting well attributes
-#        well['type'] = 'Producer'
-#        well['region'] = 'Region1'
 
 
 if __name__ == '__main__':
